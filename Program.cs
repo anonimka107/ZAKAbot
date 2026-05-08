@@ -177,6 +177,7 @@ namespace ZakaBot
                 if (text == "/start")
                 {
                     await SafeSendTextAsync(message.Chat.Id, AdminStartText, ct);
+                    await ShowAdminMenuAsync(message.Chat.Id, ct);
                     return;
                 }
 
