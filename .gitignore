@@ -1,0 +1,5 @@
+bin/
+obj/
+.vs/
+state.json
+appsettings.local.json

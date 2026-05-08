@@ -1,0 +1,1729 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using IOFile = System.IO.File;
+using Telegram.Bot;
+using Telegram.Bot.Exceptions;
+using Telegram.Bot.Polling;
+using Telegram.Bot.Types;
+using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
+
+namespace ZakaBot
+{
+    internal static class Program
+    {
+        private static async Task Main()
+        {
+            var config = BotConfig.Load();
+            if (string.IsNullOrWhiteSpace(config.TelegramBotToken) ||
+                config.TelegramBotToken == "PASTE_YOUR_TOKEN_HERE")
+            {
+                Console.WriteLine("Ошибка: укажи TELEGRAM_BOT_TOKEN или TelegramBotToken в appsettings.local.json");
+                return;
+            }
+
+            var app = new ZakaBotApp(config);
+            await app.RunAsync();
+        }
+    }
+
+    internal sealed class ZakaBotApp
+    {
+        private const string AdminUsername = "edelweiss_kk";
+        private const string DarlingUsername = "N7WAHaRBRiiNGeR";
+        private const string StrangerText = "ты не зайка.";
+        private const string DarlingStartText = "ооооой зайка привет, я вот ботика тебе сделал <3";
+        private const string AdminStartText = "салам владос, делаем ";
+        private const string DarlingForwardAckText = "отправил твое сообщение админу, вам ответит первый свободный владик <3";
+
+        private readonly TelegramBotClient _bot;
+        private readonly JsonStorage _storage;
+        private readonly Random _random = new Random();
+        private readonly TimeZoneInfo _moscowTimeZone;
+        private readonly DateTime _startedAtMoscow;
+        private readonly object _sessionLock = new object();
+
+        private BotState _state = new BotState();
+        private MessageBank _messages = new MessageBank();
+        private AdminSession? _adminSession;
+        private CancellationTokenSource? _darlingAckCts;
+        private bool _manualReplySinceLastDarlingMessage;
+
+        public ZakaBotApp(BotConfig config)
+        {
+            _bot = new TelegramBotClient(config.TelegramBotToken);
+            _storage = new JsonStorage(config.BotDataDir);
+            _moscowTimeZone = TimeZoneHelper.GetMoscowTimeZone();
+            _startedAtMoscow = NowMoscow();
+        }
+
+        public async Task RunAsync()
+        {
+            Directory.CreateDirectory(_storage.DataDir);
+            _messages = await _storage.LoadMessagesAsync();
+            _state = await _storage.LoadStateAsync();
+            CleanupExpiredOneTimeOverrides();
+            await SaveStateAsync();
+
+            Console.WriteLine("Бот запускается...");
+            Console.WriteLine("Папка данных: " + _storage.DataDir);
+
+            using (var cts = new CancellationTokenSource())
+            {
+                Console.CancelKeyPress += (sender, args) =>
+                {
+                    args.Cancel = true;
+                    cts.Cancel();
+                };
+
+                var me = await _bot.GetMeAsync(cts.Token);
+                Console.WriteLine("Бот запущен: @" + me.Username);
+
+                if (_state.AdminUserId.HasValue)
+                {
+                    await SafeSendTextAsync(_state.AdminUserId.Value, "бот запущен", cts.Token);
+                }
+
+                var receiverOptions = new ReceiverOptions
+                {
+                    AllowedUpdates = new[]
+                    {
+                        UpdateType.Message,
+                        UpdateType.CallbackQuery
+                    }
+                };
+
+                _bot.StartReceiving(
+                    HandleUpdateAsync,
+                    HandlePollingErrorAsync,
+                    receiverOptions,
+                    cts.Token);
+
+                var schedulerTask = RunSchedulerAsync(cts.Token);
+
+                Console.WriteLine("Нажми Ctrl+C для остановки.");
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, cts.Token);
+                }
+                catch (TaskCanceledException)
+                {
+                }
+
+                await schedulerTask;
+            }
+        }
+
+        private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken ct)
+        {
+            try
+            {
+                if (update.Type == UpdateType.CallbackQuery && update.CallbackQuery != null)
+                {
+                    await HandleCallbackAsync(update.CallbackQuery, ct);
+                    return;
+                }
+
+                if (update.Type == UpdateType.Message && update.Message != null)
+                {
+                    await HandleMessageAsync(update.Message, ct);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Ошибка обработки update: " + ex);
+                if (_state.AdminUserId.HasValue)
+                {
+                    await SafeSendTextAsync(_state.AdminUserId.Value, "ошибка обработки сообщения: " + ex.Message, ct);
+                }
+            }
+        }
+
+        private Task HandlePollingErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken ct)
+        {
+            var message = exception is ApiRequestException apiException
+                ? "Telegram API ошибка: " + apiException.ErrorCode + " " + apiException.Message
+                : "Polling ошибка: " + exception;
+
+            Console.WriteLine(message);
+            return Task.CompletedTask;
+        }
+
+        private async Task HandleMessageAsync(Message message, CancellationToken ct)
+        {
+            if (message.From == null)
+            {
+                return;
+            }
+
+            var role = await ResolveRoleAndRememberAsync(message.From, ct);
+            if (role == UserRole.Stranger)
+            {
+                await SafeSendTextAsync(message.Chat.Id, StrangerText, ct);
+                return;
+            }
+
+            var text = message.Text ?? string.Empty;
+
+            if (role == UserRole.Admin)
+            {
+                if (text == "/start")
+                {
+                    await SafeSendTextAsync(message.Chat.Id, AdminStartText, ct);
+                    return;
+                }
+
+                if (text == "/admin")
+                {
+                    ClearAdminSession();
+                    await ShowAdminMenuAsync(message.Chat.Id, ct);
+                    return;
+                }
+
+                if (text == "/cancel")
+                {
+                    ClearAdminSession();
+                    await SafeSendTextAsync(message.Chat.Id, "отменил", ct);
+                    await ShowAdminMenuAsync(message.Chat.Id, ct);
+                    return;
+                }
+
+                await HandleAdminTextAsync(message, ct);
+                return;
+            }
+
+            if (text == "/start")
+            {
+                await SafeSendTextAsync(message.Chat.Id, DarlingStartText, ct);
+                return;
+            }
+
+            await ForwardDarlingMessageToAdminAsync(message, ct);
+        }
+
+        private async Task HandleCallbackAsync(CallbackQuery callback, CancellationToken ct)
+        {
+            if (callback.From == null || callback.Message == null)
+            {
+                return;
+            }
+
+            var role = await ResolveRoleAndRememberAsync(callback.From, ct);
+            if (role != UserRole.Admin)
+            {
+                await _bot.AnswerCallbackQueryAsync(callback.Id, StrangerText, cancellationToken: ct);
+                if (callback.Message.Chat != null)
+                {
+                    await SafeSendTextAsync(callback.Message.Chat.Id, StrangerText, ct);
+                }
+                return;
+            }
+
+            await _bot.AnswerCallbackQueryAsync(callback.Id, cancellationToken: ct);
+
+            var chatId = callback.Message.Chat.Id;
+            var data = callback.Data ?? string.Empty;
+
+            if (data != "confirm:yes" && data != "confirm:no")
+            {
+                ClearAdminSession();
+            }
+
+            if (data == "menu:main")
+            {
+                ClearAdminSession();
+                await ShowAdminMenuAsync(chatId, ct);
+                return;
+            }
+
+            if (data == "menu:status")
+            {
+                await ShowStatusAsync(chatId, ct);
+                return;
+            }
+
+            if (data == "menu:notifications")
+            {
+                _state.AdminNotificationsEnabled = !_state.AdminNotificationsEnabled;
+                await SaveStateAsync();
+                Console.WriteLine("Уведомления админу: " + (_state.AdminNotificationsEnabled ? "включены" : "выключены"));
+                await SafeSendTextAsync(chatId, _state.AdminNotificationsEnabled ? "уведомления включены" : "уведомления выключены", ct);
+                await ShowAdminMenuAsync(chatId, ct);
+                return;
+            }
+
+            if (data == "menu:send_now")
+            {
+                SetAdminSession(new AdminSession(PendingAction.SendNow));
+                await SafeSendTextAsync(chatId, "напиши текст, который отправить зайке", ct);
+                return;
+            }
+
+            if (data == "reply:darling")
+            {
+                SetAdminSession(new AdminSession(PendingAction.ReplyToDarling));
+                await SafeSendTextAsync(chatId, "напиши ответ зайке", ct);
+                return;
+            }
+
+            if (data == "menu:bank")
+            {
+                await ShowBankMenuAsync(chatId, ct);
+                return;
+            }
+
+            if (data.StartsWith("view:", StringComparison.Ordinal))
+            {
+                await HandleViewBankCallbackAsync(chatId, data, ct);
+                return;
+            }
+
+            if (data.StartsWith("bank:", StringComparison.Ordinal))
+            {
+                await HandleBankActionCallbackAsync(chatId, data, ct);
+                return;
+            }
+
+            if (data == "menu:morning")
+            {
+                await ShowReminderMenuAsync(chatId, ReminderKind.Morning, ct);
+                return;
+            }
+
+            if (data == "menu:night")
+            {
+                await ShowReminderMenuAsync(chatId, ReminderKind.Night, ct);
+                return;
+            }
+
+            if (data.StartsWith("rem:", StringComparison.Ordinal))
+            {
+                await HandleReminderCallbackAsync(chatId, data, ct);
+                return;
+            }
+
+            if (data == "confirm:yes" || data == "confirm:no")
+            {
+                await HandleConfirmationAsync(chatId, data == "confirm:yes", ct);
+                return;
+            }
+        }
+
+        private async Task HandleAdminTextAsync(Message message, CancellationToken ct)
+        {
+            var session = GetActiveAdminSession();
+            if (session == null)
+            {
+                return;
+            }
+
+            var chatId = message.Chat.Id;
+            var text = message.Text;
+            if (string.IsNullOrEmpty(text))
+            {
+                await SafeSendTextAsync(chatId, "нужен текст", ct);
+                return;
+            }
+
+            if (text.Length > 4096)
+            {
+                await SafeSendTextAsync(chatId, "текст слишком длинный, максимум 4096 символов", ct);
+                return;
+            }
+
+            session.Touch();
+
+            switch (session.Action)
+            {
+                case PendingAction.AddMessage:
+                    AddMessage(session.Bank, text);
+                    await SaveMessagesAsync();
+                    await SaveStateAsync();
+                    Console.WriteLine("Добавлено сообщение в банк: " + GetBankTitle(session.Bank));
+                    ClearAdminSession();
+                    await SafeSendTextAsync(chatId, "добавил", ct);
+                    await ShowBankMenuAsync(chatId, ct);
+                    break;
+
+                case PendingAction.DeleteMessageNumber:
+                    await HandleDeleteNumberAsync(chatId, session, text, ct);
+                    break;
+
+                case PendingAction.EditMessageNumber:
+                    await HandleEditNumberAsync(chatId, session, text, ct);
+                    break;
+
+                case PendingAction.EditMessageText:
+                    session.NewText = text;
+                    session.Action = PendingAction.ConfirmEditMessage;
+                    SetAdminSession(session);
+                    await SafeSendTextAsync(chatId, "сохранить новый текст?\n\n" + text, ConfirmKeyboard(), ct);
+                    break;
+
+                case PendingAction.SendNow:
+                    session.NewText = text;
+                    session.Action = PendingAction.ConfirmSendNow;
+                    SetAdminSession(session);
+                    await SafeSendTextAsync(chatId, "отправить зайке?\n\n" + text, ConfirmKeyboard(), ct);
+                    break;
+
+                case PendingAction.ReplyToDarling:
+                    session.NewText = text;
+                    session.Action = PendingAction.ConfirmReplyToDarling;
+                    SetAdminSession(session);
+                    await SafeSendTextAsync(chatId, "отправить зайке?\n\n" + text, ConfirmKeyboard(), ct);
+                    break;
+
+                case PendingAction.ChangeTimeInput:
+                    await HandleChangeTimeInputAsync(chatId, session, text, ct);
+                    break;
+
+                case PendingAction.PostponeInput:
+                    await HandlePostponeInputAsync(chatId, session, text, ct);
+                    break;
+            }
+        }
+
+        private async Task HandleDeleteNumberAsync(long chatId, AdminSession session, string text, CancellationToken ct)
+        {
+            int number;
+            if (!int.TryParse(text.Trim(), out number) || number < 1 || number > GetBank(session.Bank).Count)
+            {
+                await SafeSendTextAsync(chatId, "нет такого номера, введи заново", ct);
+                return;
+            }
+
+            session.MessageIndex = number - 1;
+            session.Action = PendingAction.ConfirmDeleteMessage;
+            SetAdminSession(session);
+
+            await SafeSendTextAsync(chatId, "точно удалить?\n\n" + GetBank(session.Bank)[number - 1], ConfirmKeyboard(), ct);
+        }
+
+        private async Task HandleEditNumberAsync(long chatId, AdminSession session, string text, CancellationToken ct)
+        {
+            int number;
+            if (!int.TryParse(text.Trim(), out number) || number < 1 || number > GetBank(session.Bank).Count)
+            {
+                await SafeSendTextAsync(chatId, "нет такого номера, введи заново", ct);
+                return;
+            }
+
+            session.MessageIndex = number - 1;
+            session.Action = PendingAction.EditMessageText;
+            SetAdminSession(session);
+
+            await SafeSendTextAsync(chatId, "старый текст:\n\n" + GetBank(session.Bank)[number - 1] + "\n\nотправь новый текст", ct);
+        }
+
+        private async Task HandleChangeTimeInputAsync(long chatId, AdminSession session, string text, CancellationToken ct)
+        {
+            TimeSpan time;
+            if (!TryParseTime(text, out time))
+            {
+                await SafeSendTextAsync(chatId, "не понял время, введи например 9:45 или 09:45", ct);
+                return;
+            }
+
+            session.NewDailyTime = time;
+            session.Action = PendingAction.ConfirmChangeTime;
+            SetAdminSession(session);
+
+            await SafeSendTextAsync(
+                chatId,
+                "точно изменить время " + GetReminderTitle(session.Reminder) + " навсегда на " + FormatTime(time) + "?",
+                ConfirmKeyboard(),
+                ct);
+        }
+
+        private async Task HandlePostponeInputAsync(long chatId, AdminSession session, string text, CancellationToken ct)
+        {
+            DateTime dateTime;
+            if (!TryParseMoscowDateTime(text, out dateTime))
+            {
+                await SafeSendTextAsync(chatId, "не понял дату, введи например 2026-05-10 9:45 или 10.05.2026 9:45", ct);
+                return;
+            }
+
+            if (dateTime <= NowMoscow())
+            {
+                await SafeSendTextAsync(chatId, "это время уже в прошлом, введи заново", ct);
+                return;
+            }
+
+            session.NewOneTimeAt = dateTime;
+            session.Action = PendingAction.ConfirmPostpone;
+            SetAdminSession(session);
+
+            await SafeSendTextAsync(
+                chatId,
+                "перенести ближайшее " + GetReminderTitle(session.Reminder) + " на " + FormatDateTime(dateTime) + "?",
+                ConfirmKeyboard(),
+                ct);
+        }
+
+        private async Task HandleConfirmationAsync(long chatId, bool accepted, CancellationToken ct)
+        {
+            var session = GetActiveAdminSession();
+            if (session == null || !IsConfirmationAction(session.Action))
+            {
+                await SafeSendTextAsync(chatId, "действие уже неактуально", ct);
+                await ShowAdminMenuAsync(chatId, ct);
+                return;
+            }
+
+            if (!accepted)
+            {
+                ClearAdminSession();
+                await SafeSendTextAsync(chatId, "отменил", ct);
+                await ShowAdminMenuAsync(chatId, ct);
+                return;
+            }
+
+            switch (session.Action)
+            {
+                case PendingAction.ConfirmDeleteMessage:
+                    DeleteMessage(session.Bank, session.MessageIndex.GetValueOrDefault());
+                    await SaveMessagesAsync();
+                    await SaveStateAsync();
+                    Console.WriteLine("Удалено сообщение из банка: " + GetBankTitle(session.Bank));
+                    ClearAdminSession();
+                    await SafeSendTextAsync(chatId, "удалил", ct);
+                    await ShowBankMenuAsync(chatId, ct);
+                    break;
+
+                case PendingAction.ConfirmEditMessage:
+                    GetBank(session.Bank)[session.MessageIndex.GetValueOrDefault()] = session.NewText ?? string.Empty;
+                    await SaveMessagesAsync();
+                    Console.WriteLine("Отредактировано сообщение в банке: " + GetBankTitle(session.Bank));
+                    ClearAdminSession();
+                    await SafeSendTextAsync(chatId, "сохранил", ct);
+                    await ShowBankMenuAsync(chatId, ct);
+                    break;
+
+                case PendingAction.ConfirmSendNow:
+                case PendingAction.ConfirmReplyToDarling:
+                    await SendManualMessageToDarlingAsync(chatId, session.NewText ?? string.Empty, ct);
+                    ClearAdminSession();
+                    await ShowAdminMenuAsync(chatId, ct);
+                    break;
+
+                case PendingAction.ConfirmChangeTime:
+                    ApplyDailyTimeChange(session.Reminder, session.NewDailyTime.GetValueOrDefault());
+                    await SaveStateAsync();
+                    Console.WriteLine("Изменено время " + GetReminderTitle(session.Reminder) + ": " + GetReminder(session.Reminder).DailyTime);
+                    ClearAdminSession();
+                    await SafeSendTextAsync(chatId, "время изменено", ct);
+                    await ShowReminderMenuAsync(chatId, session.Reminder, ct);
+                    break;
+
+                case PendingAction.ConfirmPostpone:
+                    ApplyPostpone(session.Reminder, session.NewOneTimeAt.GetValueOrDefault());
+                    await SaveStateAsync();
+                    Console.WriteLine("Разовый перенос " + GetReminderTitle(session.Reminder) + ": " + FormatDateTime(session.NewOneTimeAt.GetValueOrDefault()));
+                    ClearAdminSession();
+                    await SafeSendTextAsync(chatId, "перенес", ct);
+                    await ShowReminderMenuAsync(chatId, session.Reminder, ct);
+                    break;
+
+                case PendingAction.ConfirmSkipNext:
+                    ApplySkipNext(session.Reminder);
+                    await SaveStateAsync();
+                    Console.WriteLine("Отменено ближайшее " + GetReminderTitle(session.Reminder));
+                    ClearAdminSession();
+                    await SafeSendTextAsync(chatId, "ближайшее сообщение отменено", ct);
+                    await ShowReminderMenuAsync(chatId, session.Reminder, ct);
+                    break;
+
+                case PendingAction.ConfirmDisableReminder:
+                    DisableReminder(session.Reminder);
+                    await SaveStateAsync();
+                    Console.WriteLine("Выключено: " + GetReminderTitle(session.Reminder));
+                    ClearAdminSession();
+                    await SafeSendTextAsync(chatId, "выключил", ct);
+                    await ShowReminderMenuAsync(chatId, session.Reminder, ct);
+                    break;
+            }
+        }
+
+        private async Task HandleBankActionCallbackAsync(long chatId, string data, CancellationToken ct)
+        {
+            var parts = data.Split(':');
+            if (parts.Length < 3)
+            {
+                return;
+            }
+
+            var action = parts[1];
+            var bank = ParseBank(parts[2]);
+
+            if (action == "add")
+            {
+                SetAdminSession(new AdminSession(PendingAction.AddMessage) { Bank = bank });
+                await SafeSendTextAsync(chatId, "отправь новое сообщение для банка: " + GetBankTitle(bank), ct);
+                return;
+            }
+
+            if (action == "delete")
+            {
+                SetAdminSession(new AdminSession(PendingAction.DeleteMessageNumber) { Bank = bank });
+                await SafeSendTextAsync(chatId, "введи номер сообщения, которое удалить", ct);
+                return;
+            }
+
+            if (action == "edit")
+            {
+                SetAdminSession(new AdminSession(PendingAction.EditMessageNumber) { Bank = bank });
+                await SafeSendTextAsync(chatId, "введи номер сообщения, которое редактировать", ct);
+            }
+        }
+
+        private async Task HandleViewBankCallbackAsync(long chatId, string data, CancellationToken ct)
+        {
+            var parts = data.Split(':');
+            if (parts.Length < 3)
+            {
+                return;
+            }
+
+            var bank = ParseBank(parts[1]);
+            int page;
+            if (!int.TryParse(parts[2], out page))
+            {
+                page = 0;
+            }
+
+            await ShowBankPageAsync(chatId, bank, page, ct);
+        }
+
+        private async Task HandleReminderCallbackAsync(long chatId, string data, CancellationToken ct)
+        {
+            var parts = data.Split(':');
+            if (parts.Length < 3)
+            {
+                return;
+            }
+
+            var reminder = ParseReminder(parts[1]);
+            var action = parts[2];
+            var reminderState = GetReminder(reminder);
+
+            if (action == "postpone")
+            {
+                if (!reminderState.Enabled)
+                {
+                    await SafeSendTextAsync(chatId, GetReminderTitle(reminder) + " выключено", ct);
+                    return;
+                }
+
+                SetAdminSession(new AdminSession(PendingAction.PostponeInput) { Reminder = reminder });
+                await SafeSendTextAsync(chatId, "введи дату и время переноса, например 2026-05-10 9:45 или 10.05.2026 9:45", ct);
+                return;
+            }
+
+            if (action == "change")
+            {
+                SetAdminSession(new AdminSession(PendingAction.ChangeTimeInput) { Reminder = reminder });
+                await SafeSendTextAsync(chatId, "введи новое постоянное время, например 9:45 или 09:45", ct);
+                return;
+            }
+
+            if (action == "skip")
+            {
+                if (!reminderState.Enabled)
+                {
+                    await SafeSendTextAsync(chatId, GetReminderTitle(reminder) + " выключено", ct);
+                    return;
+                }
+
+                SetAdminSession(new AdminSession(PendingAction.ConfirmSkipNext) { Reminder = reminder });
+                await SafeSendTextAsync(chatId, "точно отменить ближайшее " + GetReminderTitle(reminder) + "?", ConfirmKeyboard(), ct);
+                return;
+            }
+
+            if (action == "toggle")
+            {
+                if (reminderState.Enabled)
+                {
+                    SetAdminSession(new AdminSession(PendingAction.ConfirmDisableReminder) { Reminder = reminder });
+                    await SafeSendTextAsync(chatId, "точно выключить " + GetReminderTitle(reminder) + "?", ConfirmKeyboard(), ct);
+                }
+                else
+                {
+                    reminderState.Enabled = true;
+                    reminderState.ClearOneTimeAndSkip();
+                    await SaveStateAsync();
+                    Console.WriteLine("Включено: " + GetReminderTitle(reminder));
+                    await SafeSendTextAsync(chatId, "включил", ct);
+                    await ShowReminderMenuAsync(chatId, reminder, ct);
+                }
+                return;
+            }
+
+            if (action == "test")
+            {
+                await SendTestMessageAsync(chatId, reminder, ct);
+            }
+        }
+
+        private async Task RunSchedulerAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    await CheckReminderAsync(ReminderKind.Morning, ct);
+                    await CheckReminderAsync(ReminderKind.Night, ct);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Ошибка расписания: " + ex);
+                    if (_state.AdminUserId.HasValue)
+                    {
+                        await SafeSendTextAsync(_state.AdminUserId.Value, "ошибка расписания: " + ex.Message, ct);
+                    }
+                }
+
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(30), ct);
+                }
+                catch (TaskCanceledException)
+                {
+                }
+            }
+        }
+
+        private async Task CheckReminderAsync(ReminderKind kind, CancellationToken ct)
+        {
+            var reminder = GetReminder(kind);
+            if (!reminder.Enabled)
+            {
+                return;
+            }
+
+            var now = NowMoscow();
+
+            if (reminder.OneTimeAt.HasValue && reminder.OneTimeAt.Value < _startedAtMoscow)
+            {
+                Console.WriteLine("Устаревший разовый перенос пропущен: " + GetReminderTitle(kind));
+                reminder.OneTimeAt = null;
+                reminder.OneTimeReplacesDate = null;
+                await SaveStateAsync();
+            }
+
+            if (reminder.OneTimeAt.HasValue && now >= reminder.OneTimeAt.Value)
+            {
+                await SendScheduledMessageAsync(kind, ct);
+                reminder.OneTimeAt = null;
+                reminder.OneTimeReplacesDate = null;
+                await SaveStateAsync();
+                return;
+            }
+
+            var dailyTime = ParseSavedTime(reminder.DailyTime);
+            var todayDue = now.Date.Add(dailyTime);
+            var todayKey = DateKey(now.Date);
+
+            if (now >= todayDue &&
+                todayDue >= _startedAtMoscow &&
+                reminder.LastStandardSentDate != todayKey)
+            {
+                if (reminder.SkippedStandardDate == todayKey ||
+                    reminder.OneTimeReplacesDate == todayKey ||
+                    (reminder.OneTimeAt.HasValue && reminder.OneTimeAt.Value.Date == now.Date))
+                {
+                    reminder.LastStandardSentDate = todayKey;
+                    if (reminder.SkippedStandardDate == todayKey)
+                    {
+                        reminder.SkippedStandardDate = null;
+                    }
+                    await SaveStateAsync();
+                    return;
+                }
+
+                await SendScheduledMessageAsync(kind, ct);
+                reminder.LastStandardSentDate = todayKey;
+                await SaveStateAsync();
+            }
+        }
+
+        private async Task SendScheduledMessageAsync(ReminderKind kind, CancellationToken ct)
+        {
+            if (!_state.DarlingUserId.HasValue)
+            {
+                Console.WriteLine("Получатель не найден, отправка пропущена: " + GetReminderTitle(kind));
+                return;
+            }
+
+            string text;
+            try
+            {
+                text = GetNextMessage(kind);
+            }
+            catch (InvalidOperationException ex)
+            {
+                Console.WriteLine(ex.Message);
+                if (_state.AdminUserId.HasValue)
+                {
+                    await SafeSendTextAsync(_state.AdminUserId.Value, ex.Message, ct);
+                }
+                return;
+            }
+
+            try
+            {
+                await _bot.SendTextMessageAsync(_state.DarlingUserId.Value, text, cancellationToken: ct);
+                await SaveStateAsync();
+                Console.WriteLine("Отправлено " + GetReminderTitle(kind) + ": " + text);
+
+                if (_state.AdminNotificationsEnabled && _state.AdminUserId.HasValue)
+                {
+                    await SafeSendTextAsync(_state.AdminUserId.Value, "отправил " + GetReminderTitle(kind) + ":\n" + text, ct);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Ошибка отправки " + GetReminderTitle(kind) + ": " + ex.Message);
+                if (_state.AdminUserId.HasValue)
+                {
+                    await SafeSendTextAsync(_state.AdminUserId.Value, "ошибка отправки зайке: " + ex.Message, ct);
+                }
+            }
+        }
+
+        private async Task SendTestMessageAsync(long chatId, ReminderKind kind, CancellationToken ct)
+        {
+            var bank = GetBank(kind);
+            if (bank.Count == 0)
+            {
+                await SafeSendTextAsync(chatId, "ошибка: " + GetReminderTitle(kind) + " банк сообщений пустой", ct);
+                return;
+            }
+
+            var text = bank[_random.Next(bank.Count)];
+            await SafeSendTextAsync(chatId, text, ct);
+        }
+
+        private async Task SendManualMessageToDarlingAsync(long adminChatId, string text, CancellationToken ct)
+        {
+            if (!_state.DarlingUserId.HasValue)
+            {
+                await SafeSendTextAsync(adminChatId, "зайка еще не найдена", ct);
+                return;
+            }
+
+            try
+            {
+                await _bot.SendTextMessageAsync(_state.DarlingUserId.Value, text, cancellationToken: ct);
+                _manualReplySinceLastDarlingMessage = true;
+                await SafeSendTextAsync(adminChatId, "отправил", ct);
+            }
+            catch (Exception ex)
+            {
+                await SafeSendTextAsync(adminChatId, "ошибка отправки зайке: " + ex.Message, ct);
+            }
+        }
+
+        private async Task ForwardDarlingMessageToAdminAsync(Message message, CancellationToken ct)
+        {
+            _manualReplySinceLastDarlingMessage = false;
+
+            if (_state.AdminUserId.HasValue)
+            {
+                try
+                {
+                    await _bot.ForwardMessageAsync(_state.AdminUserId.Value, message.Chat.Id, message.MessageId, cancellationToken: ct);
+                    await SafeSendTextAsync(_state.AdminUserId.Value, "ответить зайке?", ReplyKeyboard(), ct);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Не удалось переслать сообщение админу: " + ex.Message);
+                }
+            }
+            else
+            {
+                Console.WriteLine("Админ не найден, пересылать сообщение некуда.");
+            }
+
+            ScheduleDarlingAck(message.Chat.Id);
+        }
+
+        private void ScheduleDarlingAck(long darlingChatId)
+        {
+            var oldCts = _darlingAckCts;
+            if (oldCts != null)
+            {
+                oldCts.Cancel();
+                oldCts.Dispose();
+            }
+
+            var cts = new CancellationTokenSource();
+            _darlingAckCts = cts;
+
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
+                    if (!_manualReplySinceLastDarlingMessage)
+                    {
+                        await SafeSendTextAsync(darlingChatId, DarlingForwardAckText, cts.Token);
+                    }
+                }
+                catch (TaskCanceledException)
+                {
+                }
+            });
+        }
+
+        private async Task<UserRole> ResolveRoleAndRememberAsync(User user, CancellationToken ct)
+        {
+            if (_state.AdminUserId.HasValue && user.Id == _state.AdminUserId.Value)
+            {
+                return UserRole.Admin;
+            }
+
+            if (_state.DarlingUserId.HasValue && user.Id == _state.DarlingUserId.Value)
+            {
+                return UserRole.Darling;
+            }
+
+            if (user.Username == AdminUsername)
+            {
+                _state.AdminUserId = user.Id;
+                await SaveStateAsync();
+                return UserRole.Admin;
+            }
+
+            if (user.Username == DarlingUsername)
+            {
+                _state.DarlingUserId = user.Id;
+                await SaveStateAsync();
+                return UserRole.Darling;
+            }
+
+            return UserRole.Stranger;
+        }
+
+        private async Task ShowAdminMenuAsync(long chatId, CancellationToken ct)
+        {
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Статус", "menu:status"),
+                    InlineKeyboardButton.WithCallbackData("Утро", "menu:morning")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Ночь", "menu:night"),
+                    InlineKeyboardButton.WithCallbackData("Банк сообщений", "menu:bank")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Отправить зайке сейчас", "menu:send_now")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Уведомления", "menu:notifications")
+                }
+            });
+
+            await SafeSendTextAsync(chatId, "админка", keyboard, ct);
+        }
+
+        private async Task ShowStatusAsync(long chatId, CancellationToken ct)
+        {
+            var lines = new List<string>
+            {
+                "Статус бота",
+                "",
+                FormatReminderStatus(ReminderKind.Morning),
+                "",
+                FormatReminderStatus(ReminderKind.Night),
+                "",
+                "Уведомления админу: " + (_state.AdminNotificationsEnabled ? "включены" : "выключены"),
+                "админ найден: " + (_state.AdminUserId.HasValue ? "да" : "нет"),
+                "зайка найдена: " + (_state.DarlingUserId.HasValue ? "да" : "нет")
+            };
+
+            await SafeSendTextAsync(chatId, string.Join("\n", lines), BackToMainKeyboard(), ct);
+        }
+
+        private string FormatReminderStatus(ReminderKind kind)
+        {
+            var reminder = GetReminder(kind);
+            var next = reminder.Enabled ? FormatDateTime(GetNextStandardDue(kind)) : "нет";
+            return GetReminderTitle(kind) + ": " + (reminder.Enabled ? "включено" : "выключено") + "\n" +
+                   "Время: " + reminder.DailyTime + "\n" +
+                   "Ближайшая стандартная отправка: " + next + "\n" +
+                   "Ближайшая отменена: " + (string.IsNullOrEmpty(reminder.SkippedStandardDate) ? "нет" : "да") + "\n" +
+                   "Разовый перенос: " + (reminder.OneTimeAt.HasValue ? FormatDateTime(reminder.OneTimeAt.Value) : "нет");
+        }
+
+        private async Task ShowReminderMenuAsync(long chatId, ReminderKind kind, CancellationToken ct)
+        {
+            var reminder = GetReminder(kind);
+            var toggleText = reminder.Enabled ? "Выключить" : "Включить";
+            var testText = kind == ReminderKind.Morning ? "Тест утра" : "Тест ночи";
+
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Перенести ближайшее", "rem:" + ReminderKey(kind) + ":postpone")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Изменить время", "rem:" + ReminderKey(kind) + ":change"),
+                    InlineKeyboardButton.WithCallbackData("Отменить ближайшее", "rem:" + ReminderKey(kind) + ":skip")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData(toggleText, "rem:" + ReminderKey(kind) + ":toggle"),
+                    InlineKeyboardButton.WithCallbackData(testText, "rem:" + ReminderKey(kind) + ":test")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Назад", "menu:main")
+                }
+            });
+
+            await SafeSendTextAsync(chatId, GetReminderTitle(kind), keyboard, ct);
+        }
+
+        private async Task ShowBankMenuAsync(long chatId, CancellationToken ct)
+        {
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Посмотреть утренний банк", "view:morning:0")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Посмотреть ночной банк", "view:night:0")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Добавить утреннее", "bank:add:morning"),
+                    InlineKeyboardButton.WithCallbackData("Добавить ночное", "bank:add:night")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Редактировать утреннее", "bank:edit:morning"),
+                    InlineKeyboardButton.WithCallbackData("Редактировать ночное", "bank:edit:night")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Удалить утреннее", "bank:delete:morning"),
+                    InlineKeyboardButton.WithCallbackData("Удалить ночное", "bank:delete:night")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Назад", "menu:main")
+                }
+            });
+
+            await SafeSendTextAsync(chatId, "банк сообщений", keyboard, ct);
+        }
+
+        private async Task ShowBankPageAsync(long chatId, MessageBankKind bankKind, int page, CancellationToken ct)
+        {
+            var bank = GetBank(bankKind);
+            const int pageSize = 10;
+            var pageCount = Math.Max(1, (int)Math.Ceiling(bank.Count / (double)pageSize));
+            page = Math.Max(0, Math.Min(page, pageCount - 1));
+
+            var start = page * pageSize;
+            var lines = new List<string>
+            {
+                GetBankTitle(bankKind) + " (" + bank.Count + ")",
+                "страница " + (page + 1) + " из " + pageCount,
+                ""
+            };
+
+            if (bank.Count == 0)
+            {
+                lines.Add("пусто");
+            }
+            else
+            {
+                for (var i = start; i < Math.Min(start + pageSize, bank.Count); i++)
+                {
+                    lines.Add((i + 1) + ". " + Preview(bank[i]));
+                }
+            }
+
+            var buttons = new List<InlineKeyboardButton[]>();
+            var nav = new List<InlineKeyboardButton>();
+            if (page > 0)
+            {
+                nav.Add(InlineKeyboardButton.WithCallbackData("Назад", "view:" + BankKey(bankKind) + ":" + (page - 1)));
+            }
+            if (page < pageCount - 1)
+            {
+                nav.Add(InlineKeyboardButton.WithCallbackData("Вперед", "view:" + BankKey(bankKind) + ":" + (page + 1)));
+            }
+            if (nav.Count > 0)
+            {
+                buttons.Add(nav.ToArray());
+            }
+            buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("В меню", "menu:bank") });
+
+            await SafeSendTextAsync(chatId, string.Join("\n", lines), new InlineKeyboardMarkup(buttons), ct);
+        }
+
+        private InlineKeyboardMarkup ConfirmKeyboard()
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Да", "confirm:yes"),
+                    InlineKeyboardButton.WithCallbackData("Нет", "confirm:no")
+                }
+            });
+        }
+
+        private InlineKeyboardMarkup ReplyKeyboard()
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Ответить зайке", "reply:darling")
+                }
+            });
+        }
+
+        private InlineKeyboardMarkup BackToMainKeyboard()
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Назад", "menu:main")
+                }
+            });
+        }
+
+        private async Task SafeSendTextAsync(long chatId, string text, CancellationToken ct)
+        {
+            await SafeSendTextAsync(chatId, text, null, ct);
+        }
+
+        private async Task SafeSendTextAsync(long chatId, string text, IReplyMarkup? replyMarkup, CancellationToken ct)
+        {
+            await _bot.SendTextMessageAsync(
+                chatId: chatId,
+                text: text,
+                replyMarkup: replyMarkup,
+                cancellationToken: ct);
+        }
+
+        private string GetNextMessage(ReminderKind kind)
+        {
+            var bank = GetBank(kind);
+            var queue = GetQueue(kind);
+
+            if (bank.Count == 0)
+            {
+                throw new InvalidOperationException("ошибка: " + GetReminderTitle(kind) + " банк сообщений пустой");
+            }
+
+            if (bank.Count == 1)
+            {
+                return bank[0];
+            }
+
+            SanitizeQueue(queue, bank.Count);
+            if (queue.Count == 0)
+            {
+                queue.AddRange(Enumerable.Range(0, bank.Count).OrderBy(_ => _random.Next()));
+            }
+
+            var index = queue[0];
+            queue.RemoveAt(0);
+            return bank[index];
+        }
+
+        private void AddMessage(MessageBankKind bankKind, string text)
+        {
+            var bank = GetBank(bankKind);
+            var queue = GetQueue(bankKind);
+            bank.Add(text);
+            var newIndex = bank.Count - 1;
+            var insertAt = queue.Count == 0 ? 0 : _random.Next(queue.Count + 1);
+            queue.Insert(insertAt, newIndex);
+        }
+
+        private void DeleteMessage(MessageBankKind bankKind, int index)
+        {
+            var bank = GetBank(bankKind);
+            var queue = GetQueue(bankKind);
+            if (index < 0 || index >= bank.Count)
+            {
+                return;
+            }
+
+            bank.RemoveAt(index);
+            for (var i = queue.Count - 1; i >= 0; i--)
+            {
+                if (queue[i] == index)
+                {
+                    queue.RemoveAt(i);
+                }
+                else if (queue[i] > index)
+                {
+                    queue[i]--;
+                }
+            }
+        }
+
+        private void SanitizeQueue(List<int> queue, int bankCount)
+        {
+            var seen = new HashSet<int>();
+            for (var i = queue.Count - 1; i >= 0; i--)
+            {
+                var index = queue[i];
+                if (index < 0 || index >= bankCount || !seen.Add(index))
+                {
+                    queue.RemoveAt(i);
+                }
+            }
+        }
+
+        private void ApplyDailyTimeChange(ReminderKind kind, TimeSpan time)
+        {
+            var reminder = GetReminder(kind);
+            reminder.DailyTime = FormatTime(time);
+            reminder.ClearOneTimeAndSkip();
+        }
+
+        private void ApplyPostpone(ReminderKind kind, DateTime oneTimeAt)
+        {
+            var reminder = GetReminder(kind);
+            reminder.OneTimeAt = oneTimeAt;
+            reminder.OneTimeReplacesDate = DateKey(GetNextStandardDue(kind).Date);
+            reminder.SkippedStandardDate = null;
+        }
+
+        private void ApplySkipNext(ReminderKind kind)
+        {
+            var reminder = GetReminder(kind);
+            if (reminder.OneTimeAt.HasValue)
+            {
+                reminder.SkippedStandardDate = reminder.OneTimeReplacesDate;
+                reminder.OneTimeAt = null;
+                reminder.OneTimeReplacesDate = null;
+                return;
+            }
+
+            reminder.SkippedStandardDate = DateKey(GetNextStandardDue(kind).Date);
+        }
+
+        private void DisableReminder(ReminderKind kind)
+        {
+            var reminder = GetReminder(kind);
+            reminder.Enabled = false;
+            reminder.ClearOneTimeAndSkip();
+        }
+
+        private DateTime GetNextStandardDue(ReminderKind kind)
+        {
+            var reminder = GetReminder(kind);
+            var now = NowMoscow();
+            var time = ParseSavedTime(reminder.DailyTime);
+            var due = now.Date.Add(time);
+            if (due <= now)
+            {
+                due = due.AddDays(1);
+            }
+
+            if (reminder.SkippedStandardDate == DateKey(due.Date))
+            {
+                due = due.AddDays(1);
+            }
+
+            return due;
+        }
+
+        private void CleanupExpiredOneTimeOverrides()
+        {
+            var now = NowMoscow();
+            CleanupExpiredOneTimeOverride(_state.Morning, now, "утро");
+            CleanupExpiredOneTimeOverride(_state.Night, now, "ночь");
+        }
+
+        private static void CleanupExpiredOneTimeOverride(ReminderState reminder, DateTime now, string title)
+        {
+            if (reminder.OneTimeAt.HasValue && reminder.OneTimeAt.Value < now)
+            {
+                Console.WriteLine("Устаревший разовый перенос очищен при запуске: " + title);
+                reminder.OneTimeAt = null;
+                reminder.OneTimeReplacesDate = null;
+            }
+        }
+
+        private AdminSession? GetActiveAdminSession()
+        {
+            lock (_sessionLock)
+            {
+                if (_adminSession == null)
+                {
+                    return null;
+                }
+
+                if (DateTime.UtcNow - _adminSession.UpdatedAtUtc > TimeSpan.FromMinutes(10))
+                {
+                    _adminSession = null;
+                    return null;
+                }
+
+                return _adminSession;
+            }
+        }
+
+        private void SetAdminSession(AdminSession session)
+        {
+            lock (_sessionLock)
+            {
+                session.Touch();
+                _adminSession = session;
+            }
+        }
+
+        private void ClearAdminSession()
+        {
+            lock (_sessionLock)
+            {
+                _adminSession = null;
+            }
+        }
+
+        private static bool IsConfirmationAction(PendingAction action)
+        {
+            return action == PendingAction.ConfirmDeleteMessage ||
+                   action == PendingAction.ConfirmEditMessage ||
+                   action == PendingAction.ConfirmSendNow ||
+                   action == PendingAction.ConfirmReplyToDarling ||
+                   action == PendingAction.ConfirmChangeTime ||
+                   action == PendingAction.ConfirmPostpone ||
+                   action == PendingAction.ConfirmSkipNext ||
+                   action == PendingAction.ConfirmDisableReminder;
+        }
+
+        private ReminderState GetReminder(ReminderKind kind)
+        {
+            return kind == ReminderKind.Morning ? _state.Morning : _state.Night;
+        }
+
+        private List<string> GetBank(ReminderKind kind)
+        {
+            return kind == ReminderKind.Morning ? _messages.Morning : _messages.Night;
+        }
+
+        private List<string> GetBank(MessageBankKind kind)
+        {
+            return kind == MessageBankKind.Morning ? _messages.Morning : _messages.Night;
+        }
+
+        private List<int> GetQueue(ReminderKind kind)
+        {
+            return kind == ReminderKind.Morning ? _state.MorningQueue : _state.NightQueue;
+        }
+
+        private List<int> GetQueue(MessageBankKind kind)
+        {
+            return kind == MessageBankKind.Morning ? _state.MorningQueue : _state.NightQueue;
+        }
+
+        private DateTime NowMoscow()
+        {
+            return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, _moscowTimeZone);
+        }
+
+        private async Task SaveStateAsync()
+        {
+            await _storage.SaveStateAsync(_state);
+        }
+
+        private async Task SaveMessagesAsync()
+        {
+            await _storage.SaveMessagesAsync(_messages);
+        }
+
+        private static string GetReminderTitle(ReminderKind kind)
+        {
+            return kind == ReminderKind.Morning ? "утро" : "ночь";
+        }
+
+        private static string GetBankTitle(MessageBankKind kind)
+        {
+            return kind == MessageBankKind.Morning ? "утренний банк" : "ночной банк";
+        }
+
+        private static string ReminderKey(ReminderKind kind)
+        {
+            return kind == ReminderKind.Morning ? "morning" : "night";
+        }
+
+        private static string BankKey(MessageBankKind kind)
+        {
+            return kind == MessageBankKind.Morning ? "morning" : "night";
+        }
+
+        private static ReminderKind ParseReminder(string value)
+        {
+            return value == "morning" ? ReminderKind.Morning : ReminderKind.Night;
+        }
+
+        private static MessageBankKind ParseBank(string value)
+        {
+            return value == "morning" ? MessageBankKind.Morning : MessageBankKind.Night;
+        }
+
+        private static string Preview(string text)
+        {
+            var oneLine = text.Replace("\r", " ").Replace("\n", " ");
+            return oneLine.Length <= 100 ? oneLine : oneLine.Substring(0, 100) + "...";
+        }
+
+        private static bool TryParseTime(string text, out TimeSpan time)
+        {
+            return TimeSpan.TryParseExact(text.Trim(), new[] { "h\\:mm", "hh\\:mm" }, CultureInfo.InvariantCulture, out time);
+        }
+
+        private static bool TryParseMoscowDateTime(string text, out DateTime dateTime)
+        {
+            var formats = new[]
+            {
+                "yyyy-MM-dd H:mm",
+                "yyyy-MM-dd HH:mm",
+                "dd.MM.yyyy H:mm",
+                "dd.MM.yyyy HH:mm"
+            };
+
+            return DateTime.TryParseExact(
+                text.Trim(),
+                formats,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out dateTime);
+        }
+
+        private static TimeSpan ParseSavedTime(string text)
+        {
+            TimeSpan time;
+            return TryParseTime(text, out time) ? time : TimeSpan.Zero;
+        }
+
+        private static string FormatTime(TimeSpan time)
+        {
+            return time.ToString(@"hh\:mm", CultureInfo.InvariantCulture);
+        }
+
+        private static string FormatDateTime(DateTime dateTime)
+        {
+            return dateTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+        }
+
+        private static string DateKey(DateTime date)
+        {
+            return date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }
+    }
+
+    internal sealed class BotConfig
+    {
+        public string TelegramBotToken { get; set; } = string.Empty;
+        public string BotDataDir { get; set; } = string.Empty;
+
+        public static BotConfig Load()
+        {
+            var config = new BotConfig();
+            var localConfigPath = Path.Combine(Directory.GetCurrentDirectory(), "appsettings.local.json");
+
+            if (IOFile.Exists(localConfigPath))
+            {
+                var fileConfig = JsonSerializer.Deserialize<BotConfig>(IOFile.ReadAllText(localConfigPath));
+                if (fileConfig != null)
+                {
+                    config = fileConfig;
+                }
+            }
+
+            var tokenFromEnv = Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN");
+            if (!string.IsNullOrWhiteSpace(tokenFromEnv))
+            {
+                config.TelegramBotToken = tokenFromEnv;
+            }
+
+            var dataDirFromEnv = Environment.GetEnvironmentVariable("BOT_DATA_DIR");
+            if (!string.IsNullOrWhiteSpace(dataDirFromEnv))
+            {
+                config.BotDataDir = dataDirFromEnv;
+            }
+
+            if (string.IsNullOrWhiteSpace(config.BotDataDir))
+            {
+                config.BotDataDir = Directory.GetCurrentDirectory();
+            }
+
+            return config;
+        }
+    }
+
+    internal sealed class JsonStorage
+    {
+        private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+        };
+
+        private readonly SemaphoreSlim _lock = new SemaphoreSlim(1, 1);
+
+        public JsonStorage(string dataDir)
+        {
+            DataDir = Path.GetFullPath(dataDir);
+        }
+
+        public string DataDir { get; }
+
+        private string StatePath { get { return Path.Combine(DataDir, "state.json"); } }
+
+        private string MessagesPath { get { return Path.Combine(DataDir, "messages.json"); } }
+
+        public async Task<BotState> LoadStateAsync()
+        {
+            Directory.CreateDirectory(DataDir);
+            if (!IOFile.Exists(StatePath))
+            {
+                var state = BotState.CreateDefault();
+                await SaveStateAsync(state);
+                Console.WriteLine("Создан state.json");
+                return state;
+            }
+
+            var json = await IOFile.ReadAllTextAsync(StatePath);
+            return JsonSerializer.Deserialize<BotState>(json, JsonOptions) ?? BotState.CreateDefault();
+        }
+
+        public async Task<MessageBank> LoadMessagesAsync()
+        {
+            Directory.CreateDirectory(DataDir);
+            if (!IOFile.Exists(MessagesPath))
+            {
+                var templatePath = Path.Combine(Directory.GetCurrentDirectory(), "messages.json");
+                MessageBank messages;
+                if (IOFile.Exists(templatePath) && !PathsEqual(templatePath, MessagesPath))
+                {
+                    var json = await IOFile.ReadAllTextAsync(templatePath);
+                    messages = JsonSerializer.Deserialize<MessageBank>(json, JsonOptions) ?? MessageBank.CreateDefault();
+                }
+                else
+                {
+                    messages = MessageBank.CreateDefault();
+                }
+
+                await SaveMessagesAsync(messages);
+                Console.WriteLine("Создан messages.json");
+                return messages;
+            }
+
+            var existingJson = await IOFile.ReadAllTextAsync(MessagesPath);
+            return JsonSerializer.Deserialize<MessageBank>(existingJson, JsonOptions) ?? MessageBank.CreateDefault();
+        }
+
+        public async Task SaveStateAsync(BotState state)
+        {
+            await SaveJsonAsync(StatePath, state);
+        }
+
+        public async Task SaveMessagesAsync(MessageBank messages)
+        {
+            await SaveJsonAsync(MessagesPath, messages);
+        }
+
+        private async Task SaveJsonAsync<T>(string path, T value)
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                Directory.CreateDirectory(DataDir);
+                var json = JsonSerializer.Serialize(value, JsonOptions);
+                await IOFile.WriteAllTextAsync(path, json);
+            }
+            finally
+            {
+                _lock.Release();
+            }
+        }
+
+        private static bool PathsEqual(string first, string second)
+        {
+            return string.Equals(Path.GetFullPath(first).TrimEnd(Path.DirectorySeparatorChar), Path.GetFullPath(second).TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    internal sealed class BotState
+    {
+        public long? AdminUserId { get; set; }
+        public long? DarlingUserId { get; set; }
+        public bool AdminNotificationsEnabled { get; set; } = true;
+        public ReminderState Morning { get; set; } = new ReminderState { DailyTime = "10:00" };
+        public ReminderState Night { get; set; } = new ReminderState { DailyTime = "03:00" };
+        public List<int> MorningQueue { get; set; } = new List<int>();
+        public List<int> NightQueue { get; set; } = new List<int>();
+
+        public static BotState CreateDefault()
+        {
+            return new BotState();
+        }
+    }
+
+    internal sealed class ReminderState
+    {
+        public bool Enabled { get; set; } = true;
+        public string DailyTime { get; set; } = "10:00";
+        public string? LastStandardSentDate { get; set; }
+        public DateTime? OneTimeAt { get; set; }
+        public string? OneTimeReplacesDate { get; set; }
+        public string? SkippedStandardDate { get; set; }
+
+        public void ClearOneTimeAndSkip()
+        {
+            OneTimeAt = null;
+            OneTimeReplacesDate = null;
+            SkippedStandardDate = null;
+        }
+    }
+
+    internal sealed class MessageBank
+    {
+        public List<string> Morning { get; set; } = new List<string>();
+        public List<string> Night { get; set; } = new List<string>();
+
+        public static MessageBank CreateDefault()
+        {
+            return new MessageBank
+            {
+                Morning = new List<string>
+                {
+                    "привет зайка! проснулись улыбнулись, и с желанием убивать на работку",
+                    "утречка <3, к кротам как относишься?",
+                    "доброе утро, за. как настроение у тя, владику расскажи",
+                    "❝ Я ненавидел утра. Они напоминали мне, что у ночи бывает конец и что нужно вновь как-то справляться со своими мыслями. ❞",
+                    "„Уинстон, да вы пьяны! — Всё верно. А вы уродина. Завтра утром я протрезвею. А вы так и останетесь уродиной.“",
+                    "наступило утро, и мы опять живем",
+                    "просыпаемся!!!",
+                    "это не первое, и не последнее утро 143",
+                    "мы слишком молоды чтобы вести себя мудро, я знаю что говорю!!!",
+                    "опять утро, ну((("
+                },
+                Night = new List<string>
+                {
+                    "засыпай, за. владику потом расскажешь как спалось",
+                    "доброй ночи зайка. пусть сны будут мягкие, а будильник утром пойдет нахуй",
+                    "вот и день опять прошёл, ну и нахуй он пошёл! завтра будет день опять, ну и в рот его ебать. дембель стал на день короче, пацанам спокойной ночи!",
+                    "спаьсплю",
+                    "владос попросил передать: целую!",
+                    "кружок владику запиши и спаьсплю!",
+                    "ночь и тишина данная на век",
+                    "аххахахпзапахпазпхахпа",
+                    "быстренько спать оп, спокойной ночи!",
+                    "сладких снов, зайка",
+                    "але",
+                    "спишь?)"
+                }
+            };
+        }
+    }
+
+    internal sealed class AdminSession
+    {
+        public AdminSession(PendingAction action)
+        {
+            Action = action;
+            UpdatedAtUtc = DateTime.UtcNow;
+        }
+
+        public PendingAction Action { get; set; }
+        public MessageBankKind Bank { get; set; }
+        public ReminderKind Reminder { get; set; }
+        public int? MessageIndex { get; set; }
+        public string? NewText { get; set; }
+        public TimeSpan? NewDailyTime { get; set; }
+        public DateTime? NewOneTimeAt { get; set; }
+        public DateTime UpdatedAtUtc { get; private set; }
+
+        public void Touch()
+        {
+            UpdatedAtUtc = DateTime.UtcNow;
+        }
+    }
+
+    internal enum UserRole
+    {
+        Stranger,
+        Admin,
+        Darling
+    }
+
+    internal enum ReminderKind
+    {
+        Morning,
+        Night
+    }
+
+    internal enum MessageBankKind
+    {
+        Morning,
+        Night
+    }
+
+    internal enum PendingAction
+    {
+        AddMessage,
+        DeleteMessageNumber,
+        ConfirmDeleteMessage,
+        EditMessageNumber,
+        EditMessageText,
+        ConfirmEditMessage,
+        SendNow,
+        ConfirmSendNow,
+        ReplyToDarling,
+        ConfirmReplyToDarling,
+        ChangeTimeInput,
+        ConfirmChangeTime,
+        PostponeInput,
+        ConfirmPostpone,
+        ConfirmSkipNext,
+        ConfirmDisableReminder
+    }
+
+    internal static class TimeZoneHelper
+    {
+        public static TimeZoneInfo GetMoscowTimeZone()
+        {
+            try
+            {
+                return TimeZoneInfo.FindSystemTimeZoneById("Russian Standard Time");
+            }
+            catch (TimeZoneNotFoundException)
+            {
+                return TimeZoneInfo.FindSystemTimeZoneById("Europe/Moscow");
+            }
+        }
+    }
+}
