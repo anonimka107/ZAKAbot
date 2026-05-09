@@ -3,3 +3,5 @@ obj/
 .vs/
 state.json
 appsettings.local.json
+bot.log
+bot.err.log

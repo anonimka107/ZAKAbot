@@ -88,7 +88,7 @@ namespace ZakaBot
 
                 if (_state.AdminUserId.HasValue)
                 {
-                    await SafeSendTextAsync(_state.AdminUserId.Value, "бот запущен", cts.Token);
+                    await SafeSendTextAsync(_state.AdminUserId.Value, "бот запущен", AdminReplyKeyboard(), cts.Token);
                 }
 
                 var receiverOptions = new ReceiverOptions
@@ -176,12 +176,12 @@ namespace ZakaBot
             {
                 if (text == "/start")
                 {
-                    await SafeSendTextAsync(message.Chat.Id, AdminStartText, ct);
+                    await SafeSendTextAsync(message.Chat.Id, AdminStartText, AdminReplyKeyboard(), ct);
                     await ShowAdminMenuAsync(message.Chat.Id, ct);
                     return;
                 }
 
-                if (text == "/admin")
+                if (text == "/admin" || text == "Админка")
                 {
                     ClearAdminSession();
                     await ShowAdminMenuAsync(message.Chat.Id, ct);
@@ -191,7 +191,7 @@ namespace ZakaBot
                 if (text == "/cancel")
                 {
                     ClearAdminSession();
-                    await SafeSendTextAsync(message.Chat.Id, "отменил", ct);
+                    await SafeSendTextAsync(message.Chat.Id, "отменил", AdminReplyKeyboard(), ct);
                     await ShowAdminMenuAsync(message.Chat.Id, ct);
                     return;
                 }
@@ -770,6 +770,8 @@ namespace ZakaBot
                 return;
             }
 
+            text = AddReminderHeart(text, kind);
+
             try
             {
                 await _bot.SendTextMessageAsync(_state.DarlingUserId.Value, text, cancellationToken: ct);
@@ -800,7 +802,7 @@ namespace ZakaBot
                 return;
             }
 
-            var text = bank[_random.Next(bank.Count)];
+            var text = AddReminderHeart(bank[_random.Next(bank.Count)], kind);
             await SafeSendTextAsync(chatId, text, ct);
         }
 
@@ -1111,6 +1113,20 @@ namespace ZakaBot
             });
         }
 
+        private ReplyKeyboardMarkup AdminReplyKeyboard()
+        {
+            return new ReplyKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    new KeyboardButton("Админка")
+                }
+            })
+            {
+                ResizeKeyboard = true
+            };
+        }
+
         private async Task EditOrSendTextAsync(long chatId, int? messageId, string text, InlineKeyboardMarkup? replyMarkup, CancellationToken ct)
         {
             if (messageId.HasValue)
@@ -1177,6 +1193,11 @@ namespace ZakaBot
             var index = queue[0];
             queue.RemoveAt(0);
             return bank[index];
+        }
+
+        private static string AddReminderHeart(string text, ReminderKind kind)
+        {
+            return text + " " + (kind == ReminderKind.Morning ? "🤍" : "🖤");
         }
 
         private void AddMessage(MessageBankKind bankKind, string text)
