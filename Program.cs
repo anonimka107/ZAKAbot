@@ -238,6 +238,12 @@ namespace ZakaBot
                 ClearAdminSession();
             }
 
+            if (data == "flow:cancel")
+            {
+                await ShowAdminMenuAsync(chatId, ct, messageId, "отменил");
+                return;
+            }
+
             if (data == "menu:main")
             {
                 ClearAdminSession();
@@ -262,15 +268,13 @@ namespace ZakaBot
 
             if (data == "menu:send_now")
             {
-                SetAdminSession(new AdminSession(PendingAction.SendNow));
-                await EditOrSendTextAsync(chatId, messageId, "напиши текст, который отправить зайке", null, ct);
+                await StartInputSessionAsync(chatId, messageId, new AdminSession(PendingAction.SendNow), "напиши текст, который отправить зайке", ct);
                 return;
             }
 
             if (data == "reply:darling")
             {
-                SetAdminSession(new AdminSession(PendingAction.ReplyToDarling));
-                await EditOrSendTextAsync(chatId, messageId, "напиши ответ зайке", null, ct);
+                await StartInputSessionAsync(chatId, messageId, new AdminSession(PendingAction.ReplyToDarling), "напиши ответ зайке", ct);
                 return;
             }
 
@@ -329,13 +333,13 @@ namespace ZakaBot
             var text = message.Text;
             if (string.IsNullOrEmpty(text))
             {
-                await SafeSendTextAsync(chatId, "нужен текст", ct);
+                await UpdateSessionMessageAsync(chatId, session, "нужен текст\n\nпопробуй еще раз", CancelKeyboard(), ct);
                 return;
             }
 
             if (text.Length > 4096)
             {
-                await SafeSendTextAsync(chatId, "текст слишком длинный, максимум 4096 символов", ct);
+                await UpdateSessionMessageAsync(chatId, session, "текст слишком длинный, максимум 4096 символов\n\nпопробуй еще раз", CancelKeyboard(), ct);
                 return;
             }
 
@@ -349,8 +353,7 @@ namespace ZakaBot
                     await SaveStateAsync();
                     Console.WriteLine("Добавлено сообщение в банк: " + GetBankTitle(session.Bank));
                     ClearAdminSession();
-                    await SafeSendTextAsync(chatId, "добавил", ct);
-                    await ShowBankMenuAsync(chatId, ct);
+                    await ShowBankMenuAsync(chatId, ct, session.PromptMessageId, "добавил");
                     break;
 
                 case PendingAction.DeleteMessageNumber:
@@ -364,22 +367,19 @@ namespace ZakaBot
                 case PendingAction.EditMessageText:
                     session.NewText = text;
                     session.Action = PendingAction.ConfirmEditMessage;
-                    SetAdminSession(session);
-                    await SafeSendTextAsync(chatId, "сохранить новый текст?\n\n" + text, ConfirmKeyboard(), ct);
+                    await UpdateSessionMessageAsync(chatId, session, "сохранить новый текст?\n\n" + text, ConfirmKeyboard(), ct);
                     break;
 
                 case PendingAction.SendNow:
                     session.NewText = text;
                     session.Action = PendingAction.ConfirmSendNow;
-                    SetAdminSession(session);
-                    await SafeSendTextAsync(chatId, "отправить зайке?\n\n" + text, ConfirmKeyboard(), ct);
+                    await UpdateSessionMessageAsync(chatId, session, "отправить зайке?\n\n" + text, ConfirmKeyboard(), ct);
                     break;
 
                 case PendingAction.ReplyToDarling:
                     session.NewText = text;
                     session.Action = PendingAction.ConfirmReplyToDarling;
-                    SetAdminSession(session);
-                    await SafeSendTextAsync(chatId, "отправить зайке?\n\n" + text, ConfirmKeyboard(), ct);
+                    await UpdateSessionMessageAsync(chatId, session, "отправить зайке?\n\n" + text, ConfirmKeyboard(), ct);
                     break;
 
                 case PendingAction.ChangeTimeInput:
@@ -397,15 +397,14 @@ namespace ZakaBot
             int number;
             if (!int.TryParse(text.Trim(), out number) || number < 1 || number > GetBank(session.Bank).Count)
             {
-                await SafeSendTextAsync(chatId, "нет такого номера, введи заново", ct);
+                await UpdateSessionMessageAsync(chatId, session, "нет такого номера, введи заново", CancelKeyboard(), ct);
                 return;
             }
 
             session.MessageIndex = number - 1;
             session.Action = PendingAction.ConfirmDeleteMessage;
-            SetAdminSession(session);
 
-            await SafeSendTextAsync(chatId, "точно удалить?\n\n" + GetBank(session.Bank)[number - 1], ConfirmKeyboard(), ct);
+            await UpdateSessionMessageAsync(chatId, session, "точно удалить?\n\n" + GetBank(session.Bank)[number - 1], ConfirmKeyboard(), ct);
         }
 
         private async Task HandleEditNumberAsync(long chatId, AdminSession session, string text, CancellationToken ct)
@@ -413,15 +412,14 @@ namespace ZakaBot
             int number;
             if (!int.TryParse(text.Trim(), out number) || number < 1 || number > GetBank(session.Bank).Count)
             {
-                await SafeSendTextAsync(chatId, "нет такого номера, введи заново", ct);
+                await UpdateSessionMessageAsync(chatId, session, "нет такого номера, введи заново", CancelKeyboard(), ct);
                 return;
             }
 
             session.MessageIndex = number - 1;
             session.Action = PendingAction.EditMessageText;
-            SetAdminSession(session);
 
-            await SafeSendTextAsync(chatId, "старый текст:\n\n" + GetBank(session.Bank)[number - 1] + "\n\nотправь новый текст", ct);
+            await UpdateSessionMessageAsync(chatId, session, "старый текст:\n\n" + GetBank(session.Bank)[number - 1] + "\n\nотправь новый текст", CancelKeyboard(), ct);
         }
 
         private async Task HandleChangeTimeInputAsync(long chatId, AdminSession session, string text, CancellationToken ct)
@@ -429,16 +427,16 @@ namespace ZakaBot
             TimeSpan time;
             if (!TryParseTime(text, out time))
             {
-                await SafeSendTextAsync(chatId, "не понял время, введи например 9:45 или 09:45", ct);
+                await UpdateSessionMessageAsync(chatId, session, "не понял время, введи например 9:45 или 09:45", CancelKeyboard(), ct);
                 return;
             }
 
             session.NewDailyTime = time;
             session.Action = PendingAction.ConfirmChangeTime;
-            SetAdminSession(session);
 
-            await SafeSendTextAsync(
+            await UpdateSessionMessageAsync(
                 chatId,
+                session,
                 "точно изменить время " + GetReminderTitle(session.Reminder) + " навсегда на " + FormatTime(time) + "?",
                 ConfirmKeyboard(),
                 ct);
@@ -449,22 +447,22 @@ namespace ZakaBot
             DateTime dateTime;
             if (!TryParseMoscowDateTime(text, out dateTime))
             {
-                await SafeSendTextAsync(chatId, "не понял дату, введи например 2026-05-10 9:45 или 10.05.2026 9:45", ct);
+                await UpdateSessionMessageAsync(chatId, session, "не понял дату, введи например 2026-05-10 9:45 или 10.05.2026 9:45", CancelKeyboard(), ct);
                 return;
             }
 
             if (dateTime <= NowMoscow())
             {
-                await SafeSendTextAsync(chatId, "это время уже в прошлом, введи заново", ct);
+                await UpdateSessionMessageAsync(chatId, session, "это время уже в прошлом, введи заново", CancelKeyboard(), ct);
                 return;
             }
 
             session.NewOneTimeAt = dateTime;
             session.Action = PendingAction.ConfirmPostpone;
-            SetAdminSession(session);
 
-            await SafeSendTextAsync(
+            await UpdateSessionMessageAsync(
                 chatId,
+                session,
                 "перенести ближайшее " + GetReminderTitle(session.Reminder) + " на " + FormatDateTime(dateTime) + "?",
                 ConfirmKeyboard(),
                 ct);
@@ -507,9 +505,9 @@ namespace ZakaBot
 
                 case PendingAction.ConfirmSendNow:
                 case PendingAction.ConfirmReplyToDarling:
-                    await SendManualMessageToDarlingAsync(chatId, session.NewText ?? string.Empty, ct);
+                    var manualSendResult = await SendManualMessageToDarlingAsync(session.NewText ?? string.Empty, ct);
                     ClearAdminSession();
-                    await ShowAdminMenuAsync(chatId, ct);
+                    await ShowAdminMenuAsync(chatId, ct, messageId, manualSendResult);
                     break;
 
                 case PendingAction.ConfirmChangeTime:
@@ -559,22 +557,19 @@ namespace ZakaBot
 
             if (action == "add")
             {
-                SetAdminSession(new AdminSession(PendingAction.AddMessage) { Bank = bank });
-                await EditOrSendTextAsync(chatId, messageId, "отправь новое сообщение для банка: " + GetBankTitle(bank), null, ct);
+                await StartInputSessionAsync(chatId, messageId, new AdminSession(PendingAction.AddMessage) { Bank = bank }, "отправь новое сообщение для банка: " + GetBankTitle(bank), ct);
                 return;
             }
 
             if (action == "delete")
             {
-                SetAdminSession(new AdminSession(PendingAction.DeleteMessageNumber) { Bank = bank });
-                await EditOrSendTextAsync(chatId, messageId, "введи номер сообщения, которое удалить", null, ct);
+                await StartInputSessionAsync(chatId, messageId, new AdminSession(PendingAction.DeleteMessageNumber) { Bank = bank }, "введи номер сообщения, которое удалить", ct);
                 return;
             }
 
             if (action == "edit")
             {
-                SetAdminSession(new AdminSession(PendingAction.EditMessageNumber) { Bank = bank });
-                await EditOrSendTextAsync(chatId, messageId, "введи номер сообщения, которое редактировать", null, ct);
+                await StartInputSessionAsync(chatId, messageId, new AdminSession(PendingAction.EditMessageNumber) { Bank = bank }, "введи номер сообщения, которое редактировать", ct);
             }
         }
 
@@ -616,15 +611,13 @@ namespace ZakaBot
                     return;
                 }
 
-                SetAdminSession(new AdminSession(PendingAction.PostponeInput) { Reminder = reminder });
-                await EditOrSendTextAsync(chatId, messageId, "введи дату и время переноса, например 2026-05-10 9:45 или 10.05.2026 9:45", null, ct);
+                await StartInputSessionAsync(chatId, messageId, new AdminSession(PendingAction.PostponeInput) { Reminder = reminder }, "введи дату и время переноса, например 2026-05-10 9:45 или 10.05.2026 9:45", ct);
                 return;
             }
 
             if (action == "change")
             {
-                SetAdminSession(new AdminSession(PendingAction.ChangeTimeInput) { Reminder = reminder });
-                await EditOrSendTextAsync(chatId, messageId, "введи новое постоянное время, например 9:45 или 09:45", null, ct);
+                await StartInputSessionAsync(chatId, messageId, new AdminSession(PendingAction.ChangeTimeInput) { Reminder = reminder }, "введи новое постоянное время, например 9:45 или 09:45", ct);
                 return;
             }
 
@@ -806,23 +799,22 @@ namespace ZakaBot
             await SafeSendTextAsync(chatId, text, ct);
         }
 
-        private async Task SendManualMessageToDarlingAsync(long adminChatId, string text, CancellationToken ct)
+        private async Task<string> SendManualMessageToDarlingAsync(string text, CancellationToken ct)
         {
             if (!_state.DarlingUserId.HasValue)
             {
-                await SafeSendTextAsync(adminChatId, "зайка еще не найдена", ct);
-                return;
+                return "зайка еще не найдена";
             }
 
             try
             {
                 await _bot.SendTextMessageAsync(_state.DarlingUserId.Value, text, cancellationToken: ct);
                 _manualReplySinceLastDarlingMessage = true;
-                await SafeSendTextAsync(adminChatId, "отправил", ct);
+                return "отправил";
             }
             catch (Exception ex)
             {
-                await SafeSendTextAsync(adminChatId, "ошибка отправки зайке: " + ex.Message, ct);
+                return "ошибка отправки зайке: " + ex.Message;
             }
         }
 
@@ -1113,6 +1105,17 @@ namespace ZakaBot
             });
         }
 
+        private InlineKeyboardMarkup CancelKeyboard()
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Отмена", "flow:cancel")
+                }
+            });
+        }
+
         private ReplyKeyboardMarkup AdminReplyKeyboard()
         {
             return new ReplyKeyboardMarkup(new[]
@@ -1127,7 +1130,19 @@ namespace ZakaBot
             };
         }
 
-        private async Task EditOrSendTextAsync(long chatId, int? messageId, string text, InlineKeyboardMarkup? replyMarkup, CancellationToken ct)
+        private async Task StartInputSessionAsync(long chatId, int messageId, AdminSession session, string text, CancellationToken ct)
+        {
+            session.PromptMessageId = await EditOrSendTextAsync(chatId, messageId, text, CancelKeyboard(), ct);
+            SetAdminSession(session);
+        }
+
+        private async Task UpdateSessionMessageAsync(long chatId, AdminSession session, string text, InlineKeyboardMarkup? replyMarkup, CancellationToken ct)
+        {
+            session.PromptMessageId = await EditOrSendTextAsync(chatId, session.PromptMessageId, text, replyMarkup, ct);
+            SetAdminSession(session);
+        }
+
+        private async Task<int?> EditOrSendTextAsync(long chatId, int? messageId, string text, InlineKeyboardMarkup? replyMarkup, CancellationToken ct)
         {
             if (messageId.HasValue)
             {
@@ -1139,20 +1154,25 @@ namespace ZakaBot
                         text: text,
                         replyMarkup: replyMarkup,
                         cancellationToken: ct);
-                    return;
+                    return messageId.Value;
                 }
                 catch (ApiRequestException ex)
                 {
                     if (ex.Message.IndexOf("message is not modified", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        return;
+                        return messageId.Value;
                     }
 
                     Console.WriteLine("Не удалось отредактировать сообщение меню: " + ex.Message);
                 }
             }
 
-            await SafeSendTextAsync(chatId, text, replyMarkup, ct);
+            var sent = await _bot.SendTextMessageAsync(
+                chatId: chatId,
+                text: text,
+                replyMarkup: replyMarkup,
+                cancellationToken: ct);
+            return sent.MessageId;
         }
 
         private async Task SafeSendTextAsync(long chatId, string text, CancellationToken ct)
@@ -1706,6 +1726,7 @@ namespace ZakaBot
         public MessageBankKind Bank { get; set; }
         public ReminderKind Reminder { get; set; }
         public int? MessageIndex { get; set; }
+        public int? PromptMessageId { get; set; }
         public string? NewText { get; set; }
         public TimeSpan? NewDailyTime { get; set; }
         public DateTime? NewOneTimeAt { get; set; }
