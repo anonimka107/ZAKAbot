@@ -240,7 +240,7 @@ namespace ZakaBot
 
             if (data == "flow:cancel")
             {
-                await ShowAdminMenuAsync(chatId, ct, messageId, "отменил");
+                await ShowAdminMenuAsync(chatId, ct, messageId);
                 return;
             }
 
@@ -269,6 +269,12 @@ namespace ZakaBot
             if (data == "menu:send_now")
             {
                 await StartInputSessionAsync(chatId, messageId, new AdminSession(PendingAction.SendNow), "напиши текст, который отправить зайке", ct);
+                return;
+            }
+
+            if (data == "menu:send_file")
+            {
+                await StartInputSessionAsync(chatId, messageId, new AdminSession(PendingAction.SendFile), "пришли файл, песню, фото, видео, голосовое или стикер", ct);
                 return;
             }
 
@@ -330,6 +336,12 @@ namespace ZakaBot
             }
 
             var chatId = message.Chat.Id;
+            if (session.Action == PendingAction.SendFile)
+            {
+                await HandleAdminFileInputAsync(chatId, session, message, ct);
+                return;
+            }
+
             var text = message.Text;
             if (string.IsNullOrEmpty(text))
             {
@@ -407,6 +419,20 @@ namespace ZakaBot
             await UpdateSessionMessageAsync(chatId, session, "точно удалить?\n\n" + GetBank(session.Bank)[number - 1], ConfirmKeyboard(), ct);
         }
 
+        private async Task HandleAdminFileInputAsync(long chatId, AdminSession session, Message message, CancellationToken ct)
+        {
+            if (!HasSendableFileContent(message))
+            {
+                await UpdateSessionMessageAsync(chatId, session, "это не файл\n\nпришли песню, документ, фото, видео, голосовое или стикер", CancelKeyboard(), ct);
+                return;
+            }
+
+            session.SourceChatId = chatId;
+            session.SourceMessageId = message.MessageId;
+            session.Action = PendingAction.ConfirmSendFile;
+            await UpdateSessionMessageAsync(chatId, session, "отправить зайке этот файл?", ConfirmKeyboard(), ct);
+        }
+
         private async Task HandleEditNumberAsync(long chatId, AdminSession session, string text, CancellationToken ct)
         {
             int number;
@@ -480,7 +506,7 @@ namespace ZakaBot
             if (!accepted)
             {
                 ClearAdminSession();
-                await ShowAdminMenuAsync(chatId, ct, messageId, "отменил");
+                await ShowAdminMenuAsync(chatId, ct, messageId);
                 return;
             }
 
@@ -508,6 +534,12 @@ namespace ZakaBot
                     var manualSendResult = await SendManualMessageToDarlingAsync(session.NewText ?? string.Empty, ct);
                     ClearAdminSession();
                     await ShowAdminMenuAsync(chatId, ct, messageId, manualSendResult);
+                    break;
+
+                case PendingAction.ConfirmSendFile:
+                    var fileSendResult = await SendManualFileToDarlingAsync(session.SourceChatId.GetValueOrDefault(), session.SourceMessageId.GetValueOrDefault(), ct);
+                    ClearAdminSession();
+                    await ShowAdminMenuAsync(chatId, ct, messageId, fileSendResult);
                     break;
 
                 case PendingAction.ConfirmChangeTime:
@@ -818,6 +850,29 @@ namespace ZakaBot
             }
         }
 
+        private async Task<string> SendManualFileToDarlingAsync(long sourceChatId, int sourceMessageId, CancellationToken ct)
+        {
+            if (!_state.DarlingUserId.HasValue)
+            {
+                return "зайка еще не найдена";
+            }
+
+            try
+            {
+                await _bot.CopyMessageAsync(
+                    chatId: _state.DarlingUserId.Value,
+                    fromChatId: sourceChatId,
+                    messageId: sourceMessageId,
+                    cancellationToken: ct);
+                _manualReplySinceLastDarlingMessage = true;
+                return "отправил файл";
+            }
+            catch (Exception ex)
+            {
+                return "ошибка отправки файла зайке: " + ex.Message;
+            }
+        }
+
         private async Task ForwardDarlingMessageToAdminAsync(Message message, CancellationToken ct)
         {
             _manualReplySinceLastDarlingMessage = false;
@@ -916,6 +971,10 @@ namespace ZakaBot
                 new[]
                 {
                     InlineKeyboardButton.WithCallbackData("Отправить зайке сейчас", "menu:send_now")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Отправить файл зайке", "menu:send_file")
                 },
                 new[]
                 {
@@ -1380,10 +1439,23 @@ namespace ZakaBot
                    action == PendingAction.ConfirmEditMessage ||
                    action == PendingAction.ConfirmSendNow ||
                    action == PendingAction.ConfirmReplyToDarling ||
+                   action == PendingAction.ConfirmSendFile ||
                    action == PendingAction.ConfirmChangeTime ||
                    action == PendingAction.ConfirmPostpone ||
                    action == PendingAction.ConfirmSkipNext ||
                    action == PendingAction.ConfirmDisableReminder;
+        }
+
+        private static bool HasSendableFileContent(Message message)
+        {
+            return message.Audio != null ||
+                   message.Document != null ||
+                   message.Photo != null ||
+                   message.Video != null ||
+                   message.Voice != null ||
+                   message.VideoNote != null ||
+                   message.Animation != null ||
+                   message.Sticker != null;
         }
 
         private ReminderState GetReminder(ReminderKind kind)
@@ -1727,6 +1799,8 @@ namespace ZakaBot
         public ReminderKind Reminder { get; set; }
         public int? MessageIndex { get; set; }
         public int? PromptMessageId { get; set; }
+        public long? SourceChatId { get; set; }
+        public int? SourceMessageId { get; set; }
         public string? NewText { get; set; }
         public TimeSpan? NewDailyTime { get; set; }
         public DateTime? NewOneTimeAt { get; set; }
@@ -1767,6 +1841,8 @@ namespace ZakaBot
         ConfirmEditMessage,
         SendNow,
         ConfirmSendNow,
+        SendFile,
+        ConfirmSendFile,
         ReplyToDarling,
         ConfirmReplyToDarling,
         ChangeTimeInput,
