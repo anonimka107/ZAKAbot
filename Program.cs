@@ -240,7 +240,9 @@ namespace ZakaBot
             var messageId = callback.Message.MessageId;
             var data = callback.Data ?? string.Empty;
 
-            if (data != "confirm:yes" && data != "confirm:no")
+            if (data != "confirm:yes" &&
+                data != "confirm:no" &&
+                !data.StartsWith("refresh:", StringComparison.Ordinal))
             {
                 ClearAdminSession();
             }
@@ -310,6 +312,24 @@ namespace ZakaBot
             if (data == "menu:bank")
             {
                 await ShowBankMenuAsync(chatId, ct, messageId);
+                return;
+            }
+
+            if (data == "menu:refresh_bank")
+            {
+                SetAdminSession(new AdminSession(PendingAction.ConfirmRefreshAllBank));
+                await EditOrSendTextAsync(
+                    chatId,
+                    messageId,
+                    "начать обновление всего банка? текущие сообщения сохранятся до финального подтверждения",
+                    ConfirmKeyboard(),
+                    ct);
+                return;
+            }
+
+            if (data.StartsWith("refresh:", StringComparison.Ordinal))
+            {
+                await HandleRefreshBankCallbackAsync(chatId, messageId, data, ct);
                 return;
             }
 
@@ -423,6 +443,34 @@ namespace ZakaBot
 
                 case PendingAction.PostponeInput:
                     await HandlePostponeInputAsync(chatId, session, text, ct);
+                    break;
+
+                case PendingAction.CollectRefreshMorning:
+                    session.DraftMorning.Add(text);
+                    SetAdminSession(session);
+                    break;
+
+                case PendingAction.CollectRefreshNight:
+                    session.DraftNight.Add(text);
+                    SetAdminSession(session);
+                    break;
+
+                case PendingAction.RefreshAddText:
+                    GetDraftBank(session, session.Bank).Add(text);
+                    await ShowRefreshBankReviewAsync(chatId, ct, session.PromptMessageId, "добавил", session);
+                    break;
+
+                case PendingAction.RefreshDeleteNumber:
+                    await HandleRefreshDeleteNumberAsync(chatId, session, text, ct);
+                    break;
+
+                case PendingAction.RefreshEditNumber:
+                    await HandleRefreshEditNumberAsync(chatId, session, text, ct);
+                    break;
+
+                case PendingAction.RefreshEditText:
+                    GetDraftBank(session, session.Bank)[session.MessageIndex.GetValueOrDefault()] = text;
+                    await ShowRefreshBankReviewAsync(chatId, ct, session.PromptMessageId, "сохранил", session);
                     break;
             }
         }
@@ -596,6 +644,13 @@ namespace ZakaBot
                     ClearAdminSession();
                     await ShowReminderMenuAsync(chatId, session.Reminder, ct, messageId, "выключил");
                     break;
+
+                case PendingAction.ConfirmRefreshAllBank:
+                    session.Action = PendingAction.CollectRefreshMorning;
+                    session.DraftMorning.Clear();
+                    session.DraftNight.Clear();
+                    await UpdateSessionMessageAsync(chatId, session, "присылай утренние сообщения", RefreshCollectKeyboard("refresh:morning_done"), ct);
+                    break;
             }
         }
 
@@ -644,6 +699,102 @@ namespace ZakaBot
             }
 
             await ShowBankPageAsync(chatId, bank, page, ct, messageId);
+        }
+
+        private async Task HandleRefreshBankCallbackAsync(long chatId, int messageId, string data, CancellationToken ct)
+        {
+            var session = GetActiveAdminSession();
+            if (session == null)
+            {
+                await ShowAdminMenuAsync(chatId, ct, messageId, "действие уже неактуально");
+                return;
+            }
+
+            var parts = data.Split(':');
+            var action = parts.Length > 1 ? parts[1] : string.Empty;
+
+            if (action == "morning_done")
+            {
+                session.Action = PendingAction.CollectRefreshNight;
+                await UpdateSessionMessageAsync(chatId, session, "присылай ночные сообщения", RefreshCollectKeyboard("refresh:night_done"), ct);
+                return;
+            }
+
+            if (action == "night_done")
+            {
+                await ShowRefreshBankReviewAsync(chatId, ct, messageId, null, session);
+                return;
+            }
+
+            if (action == "confirm")
+            {
+                _messages.Morning = new List<string>(session.DraftMorning);
+                _messages.Night = new List<string>(session.DraftNight);
+                _state.MorningQueue.Clear();
+                _state.NightQueue.Clear();
+                await SaveMessagesAsync();
+                await SaveStateAsync();
+                ClearAdminSession();
+                await ShowBankMenuAsync(chatId, ct, messageId, "банк обновлен");
+                return;
+            }
+
+            if (parts.Length < 3)
+            {
+                return;
+            }
+
+            var bank = ParseBank(parts[2]);
+            session.Bank = bank;
+
+            if (action == "add")
+            {
+                session.Action = PendingAction.RefreshAddText;
+                await UpdateSessionMessageAsync(chatId, session, "отправь новое сообщение для черновика: " + GetBankTitle(bank), CancelKeyboard(), ct);
+                return;
+            }
+
+            if (action == "delete")
+            {
+                session.Action = PendingAction.RefreshDeleteNumber;
+                await UpdateSessionMessageAsync(chatId, session, "введи номер сообщения, которое удалить из черновика", CancelKeyboard(), ct);
+                return;
+            }
+
+            if (action == "edit")
+            {
+                session.Action = PendingAction.RefreshEditNumber;
+                await UpdateSessionMessageAsync(chatId, session, "введи номер сообщения, которое редактировать в черновике", CancelKeyboard(), ct);
+            }
+        }
+
+        private async Task HandleRefreshDeleteNumberAsync(long chatId, AdminSession session, string text, CancellationToken ct)
+        {
+            var draft = GetDraftBank(session, session.Bank);
+            int number;
+            if (!int.TryParse(text.Trim(), out number) || number < 1 || number > draft.Count)
+            {
+                await UpdateSessionMessageAsync(chatId, session, "нет такого номера, введи заново", CancelKeyboard(), ct);
+                return;
+            }
+
+            draft.RemoveAt(number - 1);
+            await ShowRefreshBankReviewAsync(chatId, ct, session.PromptMessageId, "удалил", session);
+        }
+
+        private async Task HandleRefreshEditNumberAsync(long chatId, AdminSession session, string text, CancellationToken ct)
+        {
+            var draft = GetDraftBank(session, session.Bank);
+            int number;
+            if (!int.TryParse(text.Trim(), out number) || number < 1 || number > draft.Count)
+            {
+                await UpdateSessionMessageAsync(chatId, session, "нет такого номера, введи заново", CancelKeyboard(), ct);
+                return;
+            }
+
+            session.MessageIndex = number - 1;
+            session.Action = PendingAction.RefreshEditText;
+            await UpdateSessionMessageAsync(chatId, session, "старый текст:\n\n" + draft[number - 1] + "\n\nотправь новый текст", CancelKeyboard(), ct);
         }
 
         private async Task HandleReminderCallbackAsync(long chatId, int messageId, string data, CancellationToken ct)
@@ -897,6 +1048,7 @@ namespace ZakaBot
                 if (_state.AdminNotificationsEnabled && _state.AdminUserId.HasValue)
                 {
                     await SafeSendTextAsync(_state.AdminUserId.Value, "отправил " + GetReminderTitle(kind) + ":\n" + text, ct);
+                    await SendBankRemainderWarningAsync(kind, ct);
                 }
             }
             catch (Exception ex)
@@ -1192,6 +1344,10 @@ namespace ZakaBot
                 },
                 new[]
                 {
+                    InlineKeyboardButton.WithCallbackData("Обновить весь банк", "menu:refresh_bank")
+                },
+                new[]
+                {
                     InlineKeyboardButton.WithCallbackData("Назад", "menu:main")
                 }
             });
@@ -1223,7 +1379,7 @@ namespace ZakaBot
             {
                 for (var i = start; i < Math.Min(start + pageSize, bank.Count); i++)
                 {
-                    lines.Add((i + 1) + ". " + Preview(bank[i]));
+                    lines.Add((i + 1) + ". " + bank[i]);
                 }
             }
 
@@ -1246,6 +1402,41 @@ namespace ZakaBot
             await EditOrSendTextAsync(chatId, editMessageId, string.Join("\n", lines), new InlineKeyboardMarkup(buttons), ct);
         }
 
+        private async Task ShowRefreshBankReviewAsync(long chatId, CancellationToken ct, int? editMessageId, string? notice, AdminSession session)
+        {
+            session.Action = PendingAction.RefreshReview;
+            var lines = new List<string>();
+            if (!string.IsNullOrEmpty(notice))
+            {
+                lines.Add(notice);
+                lines.Add("");
+            }
+
+            lines.Add("черновик нового банка");
+            lines.Add("");
+            AppendDraftBankLines(lines, "утренний банк", session.DraftMorning);
+            lines.Add("");
+            AppendDraftBankLines(lines, "ночной банк", session.DraftNight);
+
+            session.PromptMessageId = await EditOrSendTextAsync(chatId, editMessageId, string.Join("\n", lines), RefreshReviewKeyboard(), ct);
+            SetAdminSession(session);
+        }
+
+        private static void AppendDraftBankLines(List<string> lines, string title, List<string> bank)
+        {
+            lines.Add(title + " (" + bank.Count + ")");
+            if (bank.Count == 0)
+            {
+                lines.Add("пусто");
+                return;
+            }
+
+            for (var i = 0; i < bank.Count; i++)
+            {
+                lines.Add((i + 1) + ". " + bank[i]);
+            }
+        }
+
         private InlineKeyboardMarkup ConfirmKeyboard()
         {
             return new InlineKeyboardMarkup(new[]
@@ -1254,6 +1445,51 @@ namespace ZakaBot
                 {
                     InlineKeyboardButton.WithCallbackData("Да", "confirm:yes"),
                     InlineKeyboardButton.WithCallbackData("Нет", "confirm:no")
+                }
+            });
+        }
+
+        private InlineKeyboardMarkup RefreshCollectKeyboard(string doneCallback)
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData(doneCallback == "refresh:morning_done" ? "готово с утром" : "готово с ночью", doneCallback)
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("Отмена", "flow:cancel")
+                }
+            });
+        }
+
+        private InlineKeyboardMarkup RefreshReviewKeyboard()
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("подтвердить банк", "refresh:confirm")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("добавить утро", "refresh:add:morning"),
+                    InlineKeyboardButton.WithCallbackData("добавить ночь", "refresh:add:night")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("редактировать утро", "refresh:edit:morning"),
+                    InlineKeyboardButton.WithCallbackData("редактировать ночь", "refresh:edit:night")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("удалить утро", "refresh:delete:morning"),
+                    InlineKeyboardButton.WithCallbackData("удалить ночь", "refresh:delete:night")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("отмена", "flow:cancel")
                 }
             });
         }
@@ -1388,6 +1624,27 @@ namespace ZakaBot
             var index = queue[0];
             queue.RemoveAt(0);
             return bank[index];
+        }
+
+        private async Task SendBankRemainderWarningAsync(ReminderKind kind, CancellationToken ct)
+        {
+            if (!_state.AdminNotificationsEnabled || !_state.AdminUserId.HasValue)
+            {
+                return;
+            }
+
+            var bank = GetBank(kind);
+            var remaining = bank.Count == 1 ? 0 : GetQueue(kind).Count;
+            if (remaining < 0 || remaining > 3)
+            {
+                return;
+            }
+
+            var text = remaining == 0
+                ? GetBankNominativeTitle(kind) + " банк закончился, следующий круг начнется с новым перемешиванием"
+                : "в " + GetBankPrepositionalTitle(kind) + " банке осталось " + remaining + " " + FormatMessageWord(remaining);
+
+            await SafeSendTextAsync(_state.AdminUserId.Value, text, ct);
         }
 
         private static string AddReminderHeart(string text, ReminderKind kind)
@@ -1559,7 +1816,8 @@ namespace ZakaBot
                    action == PendingAction.ConfirmChangeTime ||
                    action == PendingAction.ConfirmPostpone ||
                    action == PendingAction.ConfirmSkipNext ||
-                   action == PendingAction.ConfirmDisableReminder;
+                   action == PendingAction.ConfirmDisableReminder ||
+                   action == PendingAction.ConfirmRefreshAllBank;
         }
 
         private static bool HasSendableFileContent(Message message)
@@ -1587,6 +1845,11 @@ namespace ZakaBot
         private List<string> GetBank(MessageBankKind kind)
         {
             return kind == MessageBankKind.Morning ? _messages.Morning : _messages.Night;
+        }
+
+        private static List<string> GetDraftBank(AdminSession session, MessageBankKind kind)
+        {
+            return kind == MessageBankKind.Morning ? session.DraftMorning : session.DraftNight;
         }
 
         private List<int> GetQueue(ReminderKind kind)
@@ -1619,6 +1882,21 @@ namespace ZakaBot
             return kind == ReminderKind.Morning ? "утро" : "ночь";
         }
 
+        private static string GetBankNominativeTitle(ReminderKind kind)
+        {
+            return kind == ReminderKind.Morning ? "утренний" : "ночной";
+        }
+
+        private static string GetBankPrepositionalTitle(ReminderKind kind)
+        {
+            return kind == ReminderKind.Morning ? "утреннем" : "ночном";
+        }
+
+        private static string FormatMessageWord(int count)
+        {
+            return count == 1 ? "сообщение" : "сообщения";
+        }
+
         private static string GetBankTitle(MessageBankKind kind)
         {
             return kind == MessageBankKind.Morning ? "утренний банк" : "ночной банк";
@@ -1642,12 +1920,6 @@ namespace ZakaBot
         private static MessageBankKind ParseBank(string value)
         {
             return value == "morning" ? MessageBankKind.Morning : MessageBankKind.Night;
-        }
-
-        private static string Preview(string text)
-        {
-            var oneLine = text.Replace("\r", " ").Replace("\n", " ");
-            return oneLine.Length <= 100 ? oneLine : oneLine.Substring(0, 100) + "...";
         }
 
         private static bool TryParseTime(string text, out TimeSpan time)
@@ -1923,6 +2195,8 @@ namespace ZakaBot
         public string? NewText { get; set; }
         public TimeSpan? NewDailyTime { get; set; }
         public DateTime? NewOneTimeAt { get; set; }
+        public List<string> DraftMorning { get; } = new List<string>();
+        public List<string> DraftNight { get; } = new List<string>();
         public DateTime UpdatedAtUtc { get; private set; }
 
         public void Touch()
@@ -1969,7 +2243,15 @@ namespace ZakaBot
         PostponeInput,
         ConfirmPostpone,
         ConfirmSkipNext,
-        ConfirmDisableReminder
+        ConfirmDisableReminder,
+        ConfirmRefreshAllBank,
+        CollectRefreshMorning,
+        CollectRefreshNight,
+        RefreshReview,
+        RefreshAddText,
+        RefreshDeleteNumber,
+        RefreshEditNumber,
+        RefreshEditText
     }
 
     internal static class TimeZoneHelper
