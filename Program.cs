@@ -42,6 +42,8 @@ namespace ZakaBot
         private const string DarlingStartText = "ооооой зайка привет, я вот ботика тебе сделал <3";
         private const string AdminStartText = "салам владос, делаем ";
         private const string DarlingForwardAckText = "отправил твое сообщение админу, вам ответит первый свободный владик <3";
+        private const string DarlingOutgoingDisabledText = "отправка сообщений зайке выключена";
+        private static readonly TimeSpan Daily143Time = new TimeSpan(1, 43, 0);
 
         private readonly TelegramBotClient _bot;
         private readonly JsonStorage _storage;
@@ -202,6 +204,11 @@ namespace ZakaBot
 
             if (text == "/start")
             {
+                if (!_state.DarlingOutgoingEnabled)
+                {
+                    return;
+                }
+
                 await SafeSendTextAsync(message.Chat.Id, DarlingStartText, ct);
                 return;
             }
@@ -263,6 +270,22 @@ namespace ZakaBot
                 await SaveStateAsync();
                 Console.WriteLine("Уведомления админу: " + (_state.AdminNotificationsEnabled ? "включены" : "выключены"));
                 await ShowAdminMenuAsync(chatId, ct, messageId, _state.AdminNotificationsEnabled ? "уведомления включены" : "уведомления выключены");
+                return;
+            }
+
+            if (data == "menu:daily143")
+            {
+                _state.Daily143Enabled = !_state.Daily143Enabled;
+                await SaveStateAsync();
+                await ShowAdminMenuAsync(chatId, ct, messageId, _state.Daily143Enabled ? "1:43 включено" : "1:43 выключено");
+                return;
+            }
+
+            if (data == "menu:darling_outgoing")
+            {
+                _state.DarlingOutgoingEnabled = !_state.DarlingOutgoingEnabled;
+                await SaveStateAsync();
+                await ShowAdminMenuAsync(chatId, ct, messageId, _state.DarlingOutgoingEnabled ? "отправка сообщений зайке включена" : "отправка сообщений зайке выключена");
                 return;
             }
 
@@ -698,6 +721,7 @@ namespace ZakaBot
                 {
                     await CheckReminderAsync(ReminderKind.Morning, ct);
                     await CheckReminderAsync(ReminderKind.Night, ct);
+                    await CheckDaily143Async(ct);
                 }
                 catch (Exception ex)
                 {
@@ -772,8 +796,75 @@ namespace ZakaBot
             }
         }
 
+        private async Task CheckDaily143Async(CancellationToken ct)
+        {
+            if (!_state.Daily143Enabled)
+            {
+                return;
+            }
+
+            var now = NowMoscow();
+            var due = now.Date.Add(Daily143Time);
+            var todayKey = DateKey(now.Date);
+
+            if (now < due ||
+                due < _startedAtMoscow ||
+                _state.Daily143LastHandledDate == todayKey)
+            {
+                return;
+            }
+
+            _state.Daily143LastHandledDate = todayKey;
+            await SaveStateAsync();
+
+            if (!_state.DarlingOutgoingEnabled)
+            {
+                Console.WriteLine(DarlingOutgoingDisabledText + ": 1:43");
+                if (_state.AdminNotificationsEnabled && _state.AdminUserId.HasValue)
+                {
+                    await SafeSendTextAsync(_state.AdminUserId.Value, DarlingOutgoingDisabledText, ct);
+                }
+                return;
+            }
+
+            if (!_state.DarlingUserId.HasValue)
+            {
+                Console.WriteLine("Получатель не найден, отправка пропущена: 1:43");
+                return;
+            }
+
+            try
+            {
+                await _bot.SendTextMessageAsync(_state.DarlingUserId.Value, "!", cancellationToken: ct);
+                Console.WriteLine("Отправлено 1:43: !");
+
+                if (_state.AdminNotificationsEnabled && _state.AdminUserId.HasValue)
+                {
+                    await SafeSendTextAsync(_state.AdminUserId.Value, "отправил 1:43:\n!", ct);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Ошибка отправки 1:43: " + ex.Message);
+                if (_state.AdminUserId.HasValue)
+                {
+                    await SafeSendTextAsync(_state.AdminUserId.Value, "ошибка отправки зайке: " + ex.Message, ct);
+                }
+            }
+        }
+
         private async Task SendScheduledMessageAsync(ReminderKind kind, CancellationToken ct)
         {
+            if (!_state.DarlingOutgoingEnabled)
+            {
+                Console.WriteLine(DarlingOutgoingDisabledText + ": " + GetReminderTitle(kind));
+                if (_state.AdminNotificationsEnabled && _state.AdminUserId.HasValue)
+                {
+                    await SafeSendTextAsync(_state.AdminUserId.Value, DarlingOutgoingDisabledText, ct);
+                }
+                return;
+            }
+
             if (!_state.DarlingUserId.HasValue)
             {
                 Console.WriteLine("Получатель не найден, отправка пропущена: " + GetReminderTitle(kind));
@@ -833,6 +924,11 @@ namespace ZakaBot
 
         private async Task<string> SendManualMessageToDarlingAsync(string text, CancellationToken ct)
         {
+            if (!_state.DarlingOutgoingEnabled)
+            {
+                return DarlingOutgoingDisabledText;
+            }
+
             if (!_state.DarlingUserId.HasValue)
             {
                 return "зайка еще не найдена";
@@ -852,6 +948,11 @@ namespace ZakaBot
 
         private async Task<string> SendManualFileToDarlingAsync(long sourceChatId, int sourceMessageId, CancellationToken ct)
         {
+            if (!_state.DarlingOutgoingEnabled)
+            {
+                return DarlingOutgoingDisabledText;
+            }
+
             if (!_state.DarlingUserId.HasValue)
             {
                 return "зайка еще не найдена";
@@ -916,6 +1017,11 @@ namespace ZakaBot
                     await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
                     if (!_manualReplySinceLastDarlingMessage)
                     {
+                        if (!_state.DarlingOutgoingEnabled)
+                        {
+                            return;
+                        }
+
                         await SafeSendTextAsync(darlingChatId, DarlingForwardAckText, cts.Token);
                     }
                 }
@@ -979,6 +1085,14 @@ namespace ZakaBot
                 new[]
                 {
                     InlineKeyboardButton.WithCallbackData("Уведомления", "menu:notifications")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("1:43 вкл/выкл", "menu:daily143")
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("отправлять сообщения вкл/выкл", "menu:darling_outgoing")
                 }
             });
 
@@ -996,6 +1110,8 @@ namespace ZakaBot
                 "",
                 FormatReminderStatus(ReminderKind.Night),
                 "",
+                "1:43: " + (_state.Daily143Enabled ? "включено" : "выключено"),
+                "отправка сообщений зайке: " + (_state.DarlingOutgoingEnabled ? "включена" : "выключена"),
                 "Уведомления админу: " + (_state.AdminNotificationsEnabled ? "включены" : "выключены"),
                 "админ найден: " + (_state.AdminUserId.HasValue ? "да" : "нет"),
                 "зайка найдена: " + (_state.DarlingUserId.HasValue ? "да" : "нет")
@@ -1717,6 +1833,9 @@ namespace ZakaBot
         public long? AdminUserId { get; set; }
         public long? DarlingUserId { get; set; }
         public bool AdminNotificationsEnabled { get; set; } = true;
+        public bool Daily143Enabled { get; set; } = true;
+        public string? Daily143LastHandledDate { get; set; }
+        public bool DarlingOutgoingEnabled { get; set; } = true;
         public ReminderState Morning { get; set; } = new ReminderState { DailyTime = "10:00" };
         public ReminderState Night { get; set; } = new ReminderState { DailyTime = "03:00" };
         public List<int> MorningQueue { get; set; } = new List<int>();
